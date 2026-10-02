@@ -14,6 +14,7 @@ table image and returns a schema.Table.
 """
 
 import json
+import os
 import xml.etree.ElementTree as ET
 from typing import List
 from schema import Cell, Table
@@ -97,7 +98,10 @@ def load_pubtables1m(xml_path: str, image_id: str) -> Table:
 # ---------------------------------------------------------------------------
 
 def load_fintabnet(json_path: str, image_id: str) -> Table:
-    with open(json_path) as f:
+    # encoding="utf-8" is required, not optional: without it, open() falls back
+    # to the OS locale encoding -- cp1252 on Windows -- which crashes on any
+    # non-ASCII byte in the file (UnicodeDecodeError). JSON is UTF-8 by spec.
+    with open(json_path, encoding="utf-8") as f:
         data = json.load(f)
 
     cells = []
@@ -119,20 +123,131 @@ def load_fintabnet(json_path: str, image_id: str) -> Table:
 
 
 # ---------------------------------------------------------------------------
-# SciTSR: JSON with a "cells" list; each cell gives "content" (tokens),
-# "start_row"/"end_row"/"start_col"/"end_col", and a "pos" bbox in
-# [x1, x2, y1, y2] order (note: x-pair then y-pair, not the usual
-# xmin,ymin,xmax,ymax -- this is the actual SciTSR convention).
+# SciTSR: structure/[ID].json gives row/col spans + text CONTENT per cell,
+# but NO bounding box. Bounding boxes live separately in chunk/[ID].chunk,
+# which is a list of OCR/PDF text chunks, each with its own "pos" in
+# [x1, x2, y1, y2] order -- but chunks are NOT linked to cell IDs anywhere
+# in the released files. We recover each cell's bbox by matching its text
+# content against chunk text (see _align_chunks_to_cells below).
+#
+# Genuine limitation of the dataset, not a bug here: a cell with EMPTY
+# content (a blank table cell) has no corresponding chunk and therefore no
+# recoverable bbox. Such cells are dropped from Table.cells (counted in
+# Table.skipped_no_bbox_count) since bbox/IoU matching cannot use them.
 # ---------------------------------------------------------------------------
 
-def load_scitsr(json_path: str, image_id: str) -> Table:
-    with open(json_path) as f:
+def _normalize(s: str) -> str:
+    return " ".join(s.split()).strip().lower()
+
+
+def _to_xyxy(chunk_pos):
+    """Converts SciTSR's chunk pos [x1, x2, y1, y2] into [xmin, ymin, xmax, ymax]."""
+    x1, x2, y1, y2 = chunk_pos
+    return [x1, y1, x2, y2]
+
+
+def _union_bbox(chunk_positions):
+    """Union of several chunk positions (each in SciTSR's [x1,x2,y1,y2] order),
+    returned in standard [xmin, ymin, xmax, ymax] order."""
+    converted = [_to_xyxy(p) for p in chunk_positions]
+    xs1 = [b[0] for b in converted]; ys1 = [b[1] for b in converted]
+    xs2 = [b[2] for b in converted]; ys2 = [b[3] for b in converted]
+    return [min(xs1), min(ys1), max(xs2), max(ys2)]
+
+
+def _align_chunks_to_cells(cells_raw, chunks):
+    """
+    Returns a dict: cell index in cells_raw -> bbox (xmin,ymin,xmax,ymax),
+    for every cell that could be matched to one or more chunks.
+
+    Strategy (greedy, good enough for the vast majority of cells, verify on
+    your own sample before trusting it on anything load-bearing):
+      1. Exact match: a cell's full joined content equals one chunk's text
+         (handles the common case where one chunk == one cell).
+      2. Token-level fallback: a cell's content is a list of words: Collect
+         every remaining, unused chunk whose text matches one of those
+         words exactly, and union their positions. Handles cells whose
+         text was split across multiple chunks.
+      Chunks are consumed once used, so one chunk cannot be double-assigned
+      to two different cells.
+    """
+    chunk_text_to_indices = {}
+    for i, ch in enumerate(chunks):
+        chunk_text_to_indices.setdefault(_normalize(ch["text"]), []).append(i)
+
+    used = set()
+    cell_bbox = {}
+
+    # Pass 1: exact full-text match
+    for ci, c in enumerate(cells_raw):
+        content = c.get("content", [])
+        full_text = _normalize(" ".join(content)) if content else ""
+        if not full_text:
+            continue
+        candidates = [i for i in chunk_text_to_indices.get(full_text, []) if i not in used]
+        if candidates:
+            idx = candidates[0]
+            used.add(idx)
+            cell_bbox[ci] = _to_xyxy(chunks[idx]["pos"])
+
+    # Pass 2: token-level fallback for anything still unmatched
+    for ci, c in enumerate(cells_raw):
+        if ci in cell_bbox:
+            continue
+        content = c.get("content", [])
+        if not content:
+            continue
+        matched_positions = []
+        for word in content:
+            norm_word = _normalize(word)
+            candidates = [i for i in chunk_text_to_indices.get(norm_word, []) if i not in used]
+            if candidates:
+                idx = candidates[0]
+                used.add(idx)
+                matched_positions.append(chunks[idx]["pos"])
+        if matched_positions:
+            cell_bbox[ci] = _union_bbox(matched_positions)
+
+    return cell_bbox
+
+
+def load_scitsr(structure_json_path: str, image_id: str, chunk_path: str = None) -> Table:
+    """
+    structure_json_path: path to structure/[ID].json
+    chunk_path: path to chunk/[ID].chunk. If omitted, we look for a sibling
+    file next to structure_json_path with the same basename and a .chunk
+    extension (this is what download_scitsr_sample.py produces).
+    """
+    # encoding="utf-8" required -- see note in load_fintabnet above. SciTSR's
+    # chunk text comes from PDF extraction and commonly contains bytes (e.g.
+    # ligatures, accented characters, curly quotes) that are flatly invalid
+    # under Windows' default cp1252 locale encoding.
+    with open(structure_json_path, encoding="utf-8") as f:
         data = json.load(f)
+    cells_raw = data.get("cells", [])
+
+    if chunk_path is None:
+        base = os.path.splitext(structure_json_path)[0]
+        chunk_path = base + ".chunk"
+    if not os.path.exists(chunk_path):
+        raise FileNotFoundError(
+            f"No chunk file found at {chunk_path}. SciTSR cell bboxes come from "
+            f"chunk/[ID].chunk, not structure/[ID].json -- make sure both files "
+            f"are present (download_scitsr_sample.py copies both)."
+        )
+    with open(chunk_path, encoding="utf-8") as f:
+        chunk_data = json.load(f)
+    chunks = chunk_data.get("chunks", [])
+
+    cell_bbox = _align_chunks_to_cells(cells_raw, chunks)
 
     cells = []
-    for c in data.get("cells", []):
-        x1, x2, y1, y2 = c["pos"]
-        bbox = [x1, y1, x2, y2]
+    skipped = 0
+    for ci, c in enumerate(cells_raw):
+        bbox = cell_bbox.get(ci)
+        if bbox is None:
+            skipped += 1   # genuinely empty cell, or an alignment miss -- see docstring
+            continue
         text = " ".join(c.get("content", [])) if isinstance(c.get("content"), list) \
             else c.get("content", "")
         cells.append(Cell(
@@ -145,7 +260,8 @@ def load_scitsr(json_path: str, image_id: str) -> Table:
             is_header=bool(c.get("is_header", False)),
         ))
 
-    return Table(image_id=image_id, dataset_source="SciTSR", cells=cells)
+    return Table(image_id=image_id, dataset_source="SciTSR", cells=cells,
+                 skipped_no_bbox_count=skipped)
 
 
 LOADERS = {

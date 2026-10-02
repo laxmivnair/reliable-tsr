@@ -14,7 +14,13 @@ from typing import List, Optional, Dict, Any
 @dataclass
 class Cell:
     """One logical table cell."""
-    bbox: List[float]          # [xmin, ymin, xmax, ymax] in image pixel coords
+    bbox: Optional[List[float]]  # [xmin, ymin, xmax, ymax] in image pixel coords.
+                                  # None for cells where no bbox could be recovered
+                                  # (e.g. SciTSR cells with no text chunk at all --
+                                  # such cells are excluded from IoU-based matching
+                                  # upstream; this field exists so callers can still
+                                  # see they existed and were skipped, rather than
+                                  # silently vanishing.)
     start_row: int
     end_row: int
     start_col: int
@@ -34,9 +40,12 @@ class Table:
     """One table: a list of cells plus light metadata."""
     image_id: str
     dataset_source: str
-    cells: List[Cell] = field(default_factory=list)
+    cells: List[Cell] = field(default_factory=list)          # only cells WITH a bbox
     image_width: Optional[float] = None
     image_height: Optional[float] = None
+    skipped_no_bbox_count: int = 0   # cells that exist in GT but had no bbox available
+                                      # (e.g. genuinely empty SciTSR cells) -- not
+                                      # included in `cells`, not seen by matching.py
 
     def header_row_indices(self) -> set:
         return {c.start_row for c in self.cells if c.is_header} | \

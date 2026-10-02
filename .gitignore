@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+tatr-env/
+.venv/
+
+# Datasets
+data/
+scitsr_download/
+scitsr_sample/
+
+# Generated outputs
+outputs/
+pilot.json
+
+# Model weights
+*.pth
+*.pt
+*.ckpt
+
+# Environment / secrets
+.env

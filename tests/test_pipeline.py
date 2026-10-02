@@ -4,7 +4,12 @@ we know exactly which errors were injected. No TATR model or real dataset
 needed -- this proves the core logic (the part that doesn't depend on
 dataset-specific annotation formats) is correct.
 """
+import sys
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from schema import Cell, Table
 from schema import Cell, Table
 from error_extraction import extract_errors
 

@@ -25,6 +25,10 @@ class TATRPredictor:
 
         self.device = device
         self.processor = AutoImageProcessor.from_pretrained(model_name)
+        self.processor.size = {
+    "shortest_edge": 800,
+    "longest_edge": 1000
+}
         self.model = TableTransformerForObjectDetection.from_pretrained(model_name).to(device)
         self.model.eval()
         self.torch = torch
